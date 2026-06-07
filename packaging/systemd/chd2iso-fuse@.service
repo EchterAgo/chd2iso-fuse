@@ -37,7 +37,7 @@ ExecStart=/bin/sh -c '\
   [ -n "${MAX_OPEN_CHDS:-}" ] && cmd="$$cmd --max-open-chds $$MAX_OPEN_CHDS"; \
   [ "${VERBOSE:-no}" = yes ] && cmd="$$cmd --verbose"; \
   echo "Starting: $$cmd"; \
-  exec $$cmd \
+  eval exec "$$cmd" \
 '
 
 ExecStop=/bin/sh -c '/usr/bin/fusermount3 -u "$$TARGET" || /bin/true'
