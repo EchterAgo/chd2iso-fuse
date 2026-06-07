@@ -1,18 +1,18 @@
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use fuser::{
-    Config, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo,
-    LockOwner, MountOption, OpenFlags, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry, Request,
-    SessionACL,
+    BsdFileFlags, Config, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags,
+    Generation, INodeNo, LockOwner, MountOption, OpenFlags, ReplyAttr, ReplyCreate, ReplyData,
+    ReplyDirectory, ReplyEntry, ReplyWrite, Request, SessionACL, TimeOrNow, WriteFlags,
 };
 use lru::LruCache;
 use std::{
     collections::HashMap,
     ffi::OsStr,
-    fs::{self, File},
+    fs::{self, File, OpenOptions},
     io::{BufReader, Read, Seek},
     num::NonZeroUsize,
-    os::unix::fs::MetadataExt,
+    os::unix::fs::{FileExt, MetadataExt},
     path::{Path, PathBuf},
     sync::Mutex,
     time::{Duration, SystemTime},
@@ -61,6 +61,12 @@ struct Args {
     #[arg(long = "cd-allow-form2", default_value_t = false)]
     cd_allow_form2: bool,
 
+    /// Directory on the host for writable OPL cache files (e.g. games.bin).
+    /// OPL writes this after scanning to speed up subsequent game list loads.
+    /// Use --verbose to log all cache read/write/create/delete operations.
+    #[arg(long = "writable-cache", value_name = "DIR")]
+    writable_cache: Option<PathBuf>,
+
     /// Verbose logging
     #[arg(long = "verbose", default_value_t = false)]
     verbose: bool,
@@ -78,6 +84,8 @@ enum BackingKind {
     },
     /// Raw/unrecognized, default to 2048 passthrough (rare/fallback)
     Raw2048,
+    /// Writable file backed by a real file in the writable-cache directory
+    CacheFile { host_path: PathBuf },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -104,6 +112,9 @@ struct Handle {
 struct FsState {
     args: Args,
     entries: Vec<IndexEntry>,
+    /// Writable cache files (e.g. OPL's games.bin); dynamically populated.
+    cache_entries: Mutex<Vec<IndexEntry>>,
+    next_ino: Mutex<u64>,
     handles: Mutex<HashMap<u64, Handle>>,
     next_fh: Mutex<u64>,
     frame_cache: Mutex<LruCache<(u64, u64), Vec<u8>>>,
@@ -117,6 +128,8 @@ impl FsState {
 
         Ok(Self {
             entries: Vec::new(),
+            cache_entries: Mutex::new(Vec::new()),
+            next_ino: Mutex::new(2),
             handles: Mutex::new(HashMap::new()),
             next_fh: Mutex::new(1),
             frame_cache: Mutex::new(LruCache::new(cache_cap)),
@@ -166,7 +179,53 @@ impl FsState {
         }
 
         self.entries = tmp;
+        // Set next_ino base for cache files (beyond all ISO inodes)
+        *self.next_ino.lock().expect("next_ino poisoned") = self.entries.len() as u64 + 2;
+
+        // Load any existing cache files from the writable-cache directory
+        if let Some(cache_dir) = self.args.writable_cache.clone() {
+            if let Err(e) = fs::create_dir_all(&cache_dir) {
+                error!("writable-cache: failed to create {:?}: {}", cache_dir, e);
+            } else {
+                self.load_cache_entries(&cache_dir)?;
+            }
+        }
+
         Ok(())
+    }
+
+    fn load_cache_entries(&self, cache_dir: &Path) -> Result<()> {
+        let mut cache = self.cache_entries.lock().expect("cache_entries poisoned");
+        for ent in fs::read_dir(cache_dir)
+            .with_context(|| format!("reading writable-cache dir {cache_dir:?}"))?
+        {
+            let ent = ent?;
+            let path = ent.path();
+            if !ent.file_type()?.is_file() {
+                continue;
+            }
+            let name = match path.file_name().and_then(|s| s.to_str()) {
+                Some(n) => n.to_string(),
+                None => continue,
+            };
+            let size = ent.metadata().map(|m| m.len()).unwrap_or(0);
+            let ino = self.alloc_ino();
+            cache.push(IndexEntry {
+                ino,
+                name,
+                chd_path: PathBuf::new(),
+                kind: BackingKind::CacheFile { host_path: path },
+                iso_size: size,
+            });
+        }
+        Ok(())
+    }
+
+    fn alloc_ino(&self) -> u64 {
+        let mut next = self.next_ino.lock().expect("next_ino poisoned");
+        let ino = *next;
+        *next += 1;
+        ino
     }
 
     fn build_index_entry(&self, chd_path: &Path) -> Result<Option<(String, BackingKind, u64)>> {
@@ -571,15 +630,28 @@ impl Filesystem for FsState {
         if let Some(e) = self.entries.iter().find(|e| e.name == name_str) {
             let attr = file_attr_for(e).unwrap_or_else(|_| default_file_attr(e));
             reply.entry(&TTL, &attr, Generation(0));
-        } else {
-            reply.error(Errno::from_i32(libc::ENOENT));
+            return;
         }
+
+        let cache = self.cache_entries.lock().expect("cache_entries poisoned");
+        if let Some(e) = cache.iter().find(|e| e.name == name_str) {
+            reply.entry(&TTL, &cache_file_attr(e), Generation(0));
+            return;
+        }
+        drop(cache);
+
+        reply.error(Errno::from_i32(libc::ENOENT));
     }
 
     fn getattr(&self, _req: &Request, ino: INodeNo, fh: Option<FileHandle>, reply: ReplyAttr) {
         let _ = fh;
 
         if ino.0 == 1 {
+            let perm = if self.args.writable_cache.is_some() {
+                0o777
+            } else {
+                0o755
+            };
             let attr = FileAttr {
                 ino: INodeNo(1),
                 size: 0,
@@ -589,7 +661,7 @@ impl Filesystem for FsState {
                 ctime: SystemTime::now(),
                 crtime: SystemTime::UNIX_EPOCH,
                 kind: FileType::Directory,
-                perm: 0o755,
+                perm,
                 nlink: 2,
                 uid: unsafe { libc::geteuid() },
                 gid: unsafe { libc::getegid() },
@@ -607,9 +679,17 @@ impl Filesystem for FsState {
                 Ok(attr) => reply.attr(&TTL, &attr),
                 Err(_) => reply.error(Errno::from_i32(libc::EIO)),
             }
-        } else {
-            reply.error(Errno::from_i32(libc::ENOENT));
+            return;
         }
+
+        let cache = self.cache_entries.lock().expect("cache_entries poisoned");
+        if let Some(e) = cache.iter().find(|e| e.ino == ino.0) {
+            reply.attr(&TTL, &cache_file_attr(e));
+            return;
+        }
+        drop(cache);
+
+        reply.error(Errno::from_i32(libc::ENOENT));
     }
 
     fn readdir(
@@ -634,6 +714,7 @@ impl Filesystem for FsState {
         }
 
         let mut ent_idx = 3u64;
+        let mut full = false;
         for e in &self.entries {
             if ent_idx <= idx {
                 ent_idx += 1;
@@ -646,36 +727,73 @@ impl Filesystem for FsState {
                 FileType::RegularFile,
                 e.name.as_str(),
             ) {
+                full = true;
                 break;
             }
 
             ent_idx += 1;
         }
 
+        if !full {
+            let cache = self.cache_entries.lock().expect("cache_entries poisoned");
+            for e in cache.iter() {
+                if ent_idx <= idx {
+                    ent_idx += 1;
+                    continue;
+                }
+                if reply.add(
+                    INodeNo(e.ino),
+                    ent_idx,
+                    FileType::RegularFile,
+                    e.name.as_str(),
+                ) {
+                    break;
+                }
+                ent_idx += 1;
+            }
+        }
+
         reply.ok();
     }
 
     fn open(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: fuser::ReplyOpen) {
-        let (file_id, chd_path) = if let Some(e) = self.entries.iter().find(|e| e.ino == ino.0) {
-            (e.ino, e.chd_path.clone())
-        } else {
-            reply.error(Errno::from_i32(libc::ENOENT));
-            return;
-        };
-
-        if File::open(&chd_path).is_err() {
-            reply.error(Errno::from_i32(libc::EIO));
+        // ISO entries
+        if let Some(e) = self.entries.iter().find(|e| e.ino == ino.0) {
+            if File::open(&e.chd_path).is_err() {
+                reply.error(Errno::from_i32(libc::EIO));
+                return;
+            }
+            let fh = self.alloc_fh();
+            self.handles.lock().expect("handles mutex poisoned").insert(
+                fh,
+                Handle {
+                    file_id: e.ino,
+                    chd_path: e.chd_path.clone(),
+                },
+            );
+            reply.opened(FileHandle(fh), FopenFlags::empty());
             return;
         }
 
-        let fh = self.alloc_fh();
+        // Cache file entries
+        let cache = self.cache_entries.lock().expect("cache_entries poisoned");
+        if let Some(e) = cache.iter().find(|e| e.ino == ino.0) {
+            if let BackingKind::CacheFile { ref host_path } = e.kind {
+                let fh = self.alloc_fh();
+                self.handles.lock().expect("handles mutex poisoned").insert(
+                    fh,
+                    Handle {
+                        file_id: e.ino,
+                        chd_path: host_path.clone(),
+                    },
+                );
+                reply.opened(FileHandle(fh), FopenFlags::empty());
+                return;
+            }
+        }
+        drop(cache);
 
-        self.handles
-            .lock()
-            .expect("handles mutex poisoned")
-            .insert(fh, Handle { file_id, chd_path });
-
-        reply.opened(FileHandle(fh), FopenFlags::empty());
+        reply.error(Errno::from_i32(libc::ENOENT));
     }
 
     fn release(
@@ -707,11 +825,16 @@ impl Filesystem for FsState {
         _lock_owner: Option<LockOwner>,
         reply: ReplyData,
     ) {
-        let ent = match self.entries.iter().find(|e| e.ino == ino.0) {
-            Some(e) => e.clone(),
-            None => {
-                reply.error(Errno::from_i32(libc::ENOENT));
-                return;
+        let ent = if let Some(e) = self.entries.iter().find(|e| e.ino == ino.0) {
+            e.clone()
+        } else {
+            let cache = self.cache_entries.lock().expect("cache_entries poisoned");
+            match cache.iter().find(|e| e.ino == ino.0) {
+                Some(e) => e.clone(),
+                None => {
+                    reply.error(Errno::from_i32(libc::ENOENT));
+                    return;
+                }
             }
         };
 
@@ -825,7 +948,276 @@ impl Filesystem for FsState {
                     reply,
                 );
             }
+            BackingKind::CacheFile { host_path } => {
+                let f = match File::open(&host_path) {
+                    Ok(f) => f,
+                    Err(_) => {
+                        reply.error(Errno::from_i32(libc::EIO));
+                        return;
+                    }
+                };
+                let file_size = match f.metadata() {
+                    Ok(m) => m.len(),
+                    Err(_) => {
+                        reply.error(Errno::from_i32(libc::EIO));
+                        return;
+                    }
+                };
+                if offset >= file_size {
+                    reply.data(&[]);
+                    return;
+                }
+                let end = offset.saturating_add(size as u64).min(file_size);
+                let to_read = (end - offset) as usize;
+                let mut buf = vec![0u8; to_read];
+                match f.read_at(&mut buf, offset) {
+                    Ok(n) => {
+                        reply.data(&buf[..n]);
+                    }
+                    Err(_) => reply.error(Errno::from_i32(libc::EIO)),
+                }
+            }
         }
+    }
+
+    fn create(
+        &self,
+        _req: &Request,
+        _parent: INodeNo,
+        name: &OsStr,
+        _mode: u32,
+        _umask: u32,
+        _flags: i32,
+        reply: ReplyCreate,
+    ) {
+        let cache_dir = match self.args.writable_cache {
+            Some(ref d) => d.clone(),
+            None => {
+                reply.error(Errno::from_i32(libc::EROFS));
+                return;
+            }
+        };
+
+        let name_str = name.to_string_lossy().to_string();
+        let host_path = cache_dir.join(&name_str);
+
+        // Remove any stale in-memory entry with the same name before recreating
+        {
+            let mut cache = self.cache_entries.lock().expect("cache_entries poisoned");
+            cache.retain(|e| e.name != name_str);
+        }
+
+        match OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&host_path)
+        {
+            Ok(_) => {}
+            Err(_) => {
+                reply.error(Errno::from_i32(libc::EIO));
+                return;
+            }
+        }
+
+        let ino = self.alloc_ino();
+        let entry = IndexEntry {
+            ino,
+            name: name_str.clone(),
+            chd_path: PathBuf::new(),
+            kind: BackingKind::CacheFile {
+                host_path: host_path.clone(),
+            },
+            iso_size: 0,
+        };
+        let attr = cache_file_attr(&entry);
+        self.cache_entries
+            .lock()
+            .expect("cache_entries poisoned")
+            .push(entry);
+
+        let fh = self.alloc_fh();
+        self.handles.lock().expect("handles mutex poisoned").insert(
+            fh,
+            Handle {
+                file_id: ino,
+                chd_path: host_path.clone(),
+            },
+        );
+
+        reply.created(
+            &TTL,
+            &attr,
+            Generation(0),
+            FileHandle(fh),
+            FopenFlags::empty(),
+        );
+    }
+
+    fn write(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: FileHandle,
+        offset: u64,
+        data: &[u8],
+        _write_flags: WriteFlags,
+        _flags: OpenFlags,
+        _lock_owner: Option<LockOwner>,
+        reply: ReplyWrite,
+    ) {
+        let offset = offset as u64;
+        let host_path = {
+            let cache = self.cache_entries.lock().expect("cache_entries poisoned");
+            match cache.iter().find(|e| e.ino == ino.0) {
+                Some(e) => match e.kind {
+                    BackingKind::CacheFile { ref host_path } => host_path.clone(),
+                    _ => {
+                        reply.error(Errno::from_i32(libc::EPERM));
+                        return;
+                    }
+                },
+                None => {
+                    reply.error(Errno::from_i32(libc::EPERM));
+                    return;
+                }
+            }
+        };
+
+        match OpenOptions::new().write(true).create(true).open(&host_path) {
+            Ok(f) => match f.write_at(data, offset) {
+                Ok(written) => {
+                    let new_end = offset + written as u64;
+                    let mut cache = self.cache_entries.lock().expect("cache_entries poisoned");
+                    if let Some(e) = cache.iter_mut().find(|e| e.ino == ino.0) {
+                        if new_end > e.iso_size {
+                            e.iso_size = new_end;
+                        }
+                    }
+                    reply.written(written as u32);
+                }
+                Err(_) => {
+                    reply.error(Errno::from_i32(libc::EIO));
+                }
+            },
+            Err(_) => {
+                reply.error(Errno::from_i32(libc::EIO));
+            }
+        }
+    }
+
+    fn setattr(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _mode: Option<u32>,
+        _uid: Option<u32>,
+        _gid: Option<u32>,
+        size: Option<u64>,
+        _atime: Option<TimeOrNow>,
+        _mtime: Option<TimeOrNow>,
+        _ctime: Option<SystemTime>,
+        _fh: Option<FileHandle>,
+        _crtime: Option<SystemTime>,
+        _chgtime: Option<SystemTime>,
+        _bkuptime: Option<SystemTime>,
+        _flags: Option<BsdFileFlags>,
+        reply: ReplyAttr,
+    ) {
+        // ISO entries: return current attrs unchanged (read-only)
+        if let Some(e) = self.entries.iter().find(|e| e.ino == ino.0) {
+            let attr = file_attr_for(e).unwrap_or_else(|_| default_file_attr(e));
+            reply.attr(&TTL, &attr);
+            return;
+        }
+
+        let mut cache = self.cache_entries.lock().expect("cache_entries poisoned");
+        if let Some(e) = cache.iter_mut().find(|e| e.ino == ino.0) {
+            if let BackingKind::CacheFile { ref host_path } = e.kind {
+                if let Some(new_size) = size {
+                    match OpenOptions::new().write(true).open(host_path) {
+                        Ok(f) => {
+                            if let Err(_) = f.set_len(new_size) {
+                                reply.error(Errno::from_i32(libc::EIO));
+                                return;
+                            }
+                            e.iso_size = new_size;
+                        }
+                        Err(_) => {
+                            reply.error(Errno::from_i32(libc::EIO));
+                            return;
+                        }
+                    }
+                }
+                let attr = cache_file_attr(e);
+                reply.attr(&TTL, &attr);
+                return;
+            }
+        }
+
+        reply.error(Errno::from_i32(libc::ENOENT));
+    }
+
+    fn unlink(&self, _req: &Request, _parent: INodeNo, name: &OsStr, reply: fuser::ReplyEmpty) {
+        let name_str = name.to_string_lossy().to_string();
+        let host_path = {
+            let cache = self.cache_entries.lock().expect("cache_entries poisoned");
+            match cache.iter().find(|e| e.name == name_str) {
+                Some(e) => match e.kind {
+                    BackingKind::CacheFile { ref host_path } => host_path.clone(),
+                    _ => {
+                        reply.error(Errno::from_i32(libc::EPERM));
+                        return;
+                    }
+                },
+                None => {
+                    reply.error(Errno::from_i32(libc::ENOENT));
+                    return;
+                }
+            }
+        };
+
+        if let Err(_) = fs::remove_file(&host_path) {
+            reply.error(Errno::from_i32(libc::EIO));
+            return;
+        }
+
+        self.cache_entries
+            .lock()
+            .expect("cache_entries poisoned")
+            .retain(|e| e.name != name_str);
+        reply.ok();
+    }
+}
+
+fn cache_file_attr(e: &IndexEntry) -> FileAttr {
+    let (size, mtime) = if let BackingKind::CacheFile { ref host_path } = e.kind {
+        let meta = host_path.metadata().ok();
+        let size = meta.as_ref().map(|m| m.len()).unwrap_or(e.iso_size);
+        let mtime = meta
+            .as_ref()
+            .and_then(|m| m.modified().ok())
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        (size, mtime)
+    } else {
+        (e.iso_size, SystemTime::UNIX_EPOCH)
+    };
+    FileAttr {
+        ino: INodeNo(e.ino),
+        size,
+        blocks: size.div_ceil(512),
+        atime: SystemTime::now(),
+        mtime,
+        ctime: mtime,
+        crtime: SystemTime::UNIX_EPOCH,
+        kind: FileType::RegularFile,
+        perm: 0o666,
+        nlink: 1,
+        uid: 0,
+        gid: 0,
+        rdev: 0,
+        flags: 0,
+        blksize: 4096,
     }
 }
 
@@ -898,11 +1290,12 @@ fn main() -> Result<()> {
     fs.build_index()?;
 
     let mut config = Config::default();
-    config.mount_options = vec![
-        MountOption::FSName("chd2iso".into()),
-        MountOption::RO,
-        MountOption::DefaultPermissions,
-    ];
+    config.mount_options = vec![MountOption::FSName("chd2iso".into())];
+    if fs.args.writable_cache.is_none() {
+        // No writable cache: enforce full read-only at the kernel level
+        config.mount_options.push(MountOption::RO);
+        config.mount_options.push(MountOption::DefaultPermissions);
+    }
 
     if fs.args.allow_other {
         config.acl = SessionACL::All;

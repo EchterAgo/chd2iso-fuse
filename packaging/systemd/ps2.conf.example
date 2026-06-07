@@ -5,6 +5,7 @@ TARGET=/mnt/retronas/roms/sony/playstation2/iso
 # Optional toggles
 ALLOW_OTHER=yes
 CD_ALLOW_FORM2=no
+#WRITABLE_CACHE=/var/cache/chd2iso-fuse/ps2
 CACHE_HUNKS=512
 CACHE_BYTES=536870912
 VERBOSE=yes
