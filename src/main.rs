@@ -26,6 +26,7 @@ use chd::Chd;
 /// Expose 2048-byte ISO stream from CD CHDs and passthrough from DVD CHDs.
 const TTL: Duration = Duration::from_secs(1);
 const CD_FRAME_2352: usize = 2352;
+const CD_FRAME_2448: usize = 2448; // 2352-byte raw sector + 96-byte subchannel (chdman createcd output)
 
 /// Flags / CLI
 #[derive(Parser, Debug)]
@@ -78,11 +79,13 @@ struct Args {
 enum BackingKind {
     /// DVD (or generic 2048 units): direct 2048 sector passthrough
     Dvd2048,
-    /// CD-style (2352 frames) -> user-data view with offsets & mapping
+    /// CD-style frames (2352 or 2448 bytes) -> 2048-byte user-data view
     Cd2352 {
         first_data_lba: u64,
         payload_kind: CdPayloadKind,
         track_frames: Option<u64>,
+        /// Raw frame size in bytes: 2352 (no subchannel) or 2448 (with subchannel, chdman createcd)
+        frame_bytes: usize,
     },
     /// Raw/unrecognized, default to 2048 passthrough (rare/fallback)
     Raw2048,
@@ -258,13 +261,18 @@ impl FsState {
                     first_data_lba: first_lba,
                     payload_kind: payload,
                     track_frames,
+                    frame_bytes: CD_FRAME_2352,
                 };
 
                 return Ok(Some((name, kind, iso_size)));
             }
 
-            let (first_lba, payload) =
-                quick_scan_first_data(&mut chd, total_frames, self.args.cd_allow_form2)?;
+            let (first_lba, payload) = quick_scan_first_data(
+                &mut chd,
+                total_frames,
+                self.args.cd_allow_form2,
+                CD_FRAME_2352,
+            )?;
 
             let (per_sector, name) = match payload {
                 CdPayloadKind::Mode1_2048 | CdPayloadKind::Mode2Form1_2048 => {
@@ -284,6 +292,70 @@ impl FsState {
                 first_data_lba: first_lba,
                 payload_kind: payload,
                 track_frames: None,
+                frame_bytes: CD_FRAME_2352,
+            };
+
+            return Ok(Some((name, kind, iso_size)));
+        }
+
+        if unit_bytes == CD_FRAME_2448 {
+            let total_frames = logical_bytes / CD_FRAME_2448 as u64;
+
+            if let Some((first_lba, payload, track_frames)) = {
+                let mut rf = BufReader::new(File::open(chd_path)?);
+                parse_cd_toc_from_metadata(&mut chd, &mut rf, self.args.cd_allow_form2)?
+            } {
+                let (per_sector, name) = match payload {
+                    CdPayloadKind::Mode1_2048 | CdPayloadKind::Mode2Form1_2048 => {
+                        (2048u64, format!("{stem}.iso"))
+                    }
+                    CdPayloadKind::Mode2Form2_2324 => {
+                        if self.args.cd_allow_form2 {
+                            (2324u64, format!("{stem} (Form2).bin"))
+                        } else {
+                            return Ok(None);
+                        }
+                    }
+                };
+
+                let frames = track_frames.unwrap_or(total_frames - first_lba);
+                let iso_size = frames * per_sector;
+                let kind = BackingKind::Cd2352 {
+                    first_data_lba: first_lba,
+                    payload_kind: payload,
+                    track_frames,
+                    frame_bytes: CD_FRAME_2448,
+                };
+
+                return Ok(Some((name, kind, iso_size)));
+            }
+
+            let (first_lba, payload) = quick_scan_first_data(
+                &mut chd,
+                total_frames,
+                self.args.cd_allow_form2,
+                CD_FRAME_2448,
+            )?;
+
+            let (per_sector, name) = match payload {
+                CdPayloadKind::Mode1_2048 | CdPayloadKind::Mode2Form1_2048 => {
+                    (2048u64, format!("{stem}.iso"))
+                }
+                CdPayloadKind::Mode2Form2_2324 => {
+                    if self.args.cd_allow_form2 {
+                        (2324u64, format!("{stem} (Form2).bin"))
+                    } else {
+                        return Ok(None);
+                    }
+                }
+            };
+
+            let iso_size = (total_frames - first_lba) * per_sector;
+            let kind = BackingKind::Cd2352 {
+                first_data_lba: first_lba,
+                payload_kind: payload,
+                track_frames: None,
+                frame_bytes: CD_FRAME_2448,
             };
 
             return Ok(Some((name, kind, iso_size)));
@@ -310,6 +382,7 @@ impl FsState {
         offset: u64,
         size: u32,
         max_len: u64,
+        frame_bytes: usize,
         reply: ReplyData,
     ) {
         let per_sector = match payload_kind {
@@ -337,7 +410,7 @@ impl FsState {
 
         while want > 0 {
             let frame_idx = start_frame + cur_iso_sector;
-            let sec = match self.get_cd_frame(file_id, path, frame_idx) {
+            let sec = match self.get_cd_frame(file_id, path, frame_idx, frame_bytes) {
                 Ok(v) => v,
                 Err(e) => {
                     error!("frame read error: {:?}", e);
@@ -362,7 +435,13 @@ impl FsState {
         reply.data(&out);
     }
 
-    fn get_cd_frame(&self, file_id: u64, path: &Path, frame_index: u64) -> Result<Vec<u8>> {
+    fn get_cd_frame(
+        &self,
+        file_id: u64,
+        path: &Path,
+        frame_index: u64,
+        frame_bytes: usize,
+    ) -> Result<Vec<u8>> {
         {
             let mut cache = self.frame_cache.lock().expect("frame_cache mutex poisoned");
             if let Some(buf) = cache.get(&(file_id, frame_index)) {
@@ -374,7 +453,7 @@ impl FsState {
         let mut chd = chd_handle.lock().expect("chd handle poisoned");
 
         let hunk_bytes = chd.header().hunk_size() as usize;
-        let frames_per_hunk = hunk_bytes / CD_FRAME_2352;
+        let frames_per_hunk = hunk_bytes / frame_bytes;
 
         if frames_per_hunk == 0 {
             return Err(anyhow!("invalid hunk size for CD"));
@@ -389,7 +468,8 @@ impl FsState {
         let mut hk = chd.hunk(hunk_index as u32)?;
         hk.read_hunk_in(&mut cmp_buf, &mut hunk_buf)?;
 
-        let frame_off = frame_in_hunk * CD_FRAME_2352;
+        let frame_off = frame_in_hunk * frame_bytes;
+        // Always return the 2352-byte raw sector; subchannel bytes (2352..2448, if any) are dropped.
         let owned = hunk_buf[frame_off..frame_off + CD_FRAME_2352].to_vec();
 
         drop(chd); // release lock before acquiring frame_cache lock
@@ -463,7 +543,7 @@ fn parse_cd_toc_from_metadata<R: Read + Seek>(
                     None
                 }
             }
-            TrackKind::Mode2Raw => None,
+            TrackKind::Mode2Raw => Some(CdPayloadKind::Mode2Form1_2048), // raw sectors: default to Form1 (PS2 data track)
         };
 
         if let Some(pk) = payload {
@@ -575,11 +655,12 @@ fn quick_scan_first_data<R: Read + Seek>(
     chd: &mut Chd<R>,
     total_frames: u64,
     allow_form2: bool,
+    frame_bytes: usize,
 ) -> Result<(u64, CdPayloadKind)> {
     let scan_limit = total_frames.min(2000);
     let mut cmp = Vec::new();
     let mut hbuf = chd.get_hunksized_buffer();
-    let frames_per_hunk = (chd.header().hunk_size() as usize) / CD_FRAME_2352;
+    let frames_per_hunk = (chd.header().hunk_size() as usize) / frame_bytes;
 
     let mut frame: u64 = 0;
     while frame < scan_limit {
@@ -589,7 +670,8 @@ fn quick_scan_first_data<R: Read + Seek>(
         let mut hk = chd.hunk(hunk_index as u32)?;
         hk.read_hunk_in(&mut cmp, &mut hbuf)?;
 
-        let base = frame_in_hunk * CD_FRAME_2352;
+        let base = frame_in_hunk * frame_bytes;
+        // Inspect only the 2352-byte raw sector; subchannel bytes (if any) are beyond this range.
         let sec = &hbuf[base..base + CD_FRAME_2352];
 
         let mode = sec[0x0F];
@@ -597,7 +679,10 @@ fn quick_scan_first_data<R: Read + Seek>(
         if mode == 0x01 {
             return Ok((frame, CdPayloadKind::Mode1_2048));
         } else if mode == 0x02 {
-            if allow_form2 {
+            // Determine Form 1 vs Form 2 from the Submode byte (SM) in the sector subheader.
+            // Subheader: bytes 16-23 of the raw sector; SM is byte 18.  Bit 5 (0x20) = Form 2.
+            let sm = sec[18];
+            if (sm & 0x20) != 0 && allow_form2 {
                 return Ok((frame, CdPayloadKind::Mode2Form2_2324));
             } else {
                 return Ok((frame, CdPayloadKind::Mode2Form1_2048));
@@ -841,6 +926,7 @@ impl Filesystem for FsState {
                 first_data_lba,
                 payload_kind,
                 track_frames,
+                frame_bytes,
             } => {
                 let per_sector = match payload_kind {
                     CdPayloadKind::Mode1_2048 | CdPayloadKind::Mode2Form1_2048 => 2048u64,
@@ -861,6 +947,7 @@ impl Filesystem for FsState {
                     offset,
                     size,
                     max_len,
+                    frame_bytes,
                     reply,
                 );
             }
