@@ -28,16 +28,16 @@ ExecStartPre=/usr/bin/mkdir -p "$$TARGET"
 
 ExecStart=/bin/sh -c '\
   set -eu; \
-  cmd="chd2iso-fuse --source \"$$SOURCE\" --mount \"$$TARGET\""; \
-  [ "${ALLOW_OTHER:-no}" = yes ] && cmd="$$cmd --allow-other"; \
-  [ "${CD_ALLOW_FORM2:-no}" = yes ] && cmd="$$cmd --cd-allow-form2"; \
-  [ "${RECURSIVE:-no}" = yes ] && cmd="$$cmd --recursive"; \
-  [ -n "${CACHE_HUNKS:-}" ] && cmd="$$cmd --cache-hunks $$CACHE_HUNKS"; \
-  [ -n "${CACHE_BYTES:-}" ] && cmd="$$cmd --cache-bytes $$CACHE_BYTES"; \
-  [ -n "${MAX_OPEN_CHDS:-}" ] && cmd="$$cmd --max-open-chds $$MAX_OPEN_CHDS"; \
-  [ "${VERBOSE:-no}" = yes ] && cmd="$$cmd --verbose"; \
-  echo "Starting: $$cmd"; \
-  eval exec "$$cmd" \
+  set -- chd2iso-fuse --source "$$SOURCE" --mount "$$TARGET"; \
+  [ "${ALLOW_OTHER:-no}" = yes ] && set -- "$$@" --allow-other; \
+  [ "${CD_ALLOW_FORM2:-no}" = yes ] && set -- "$$@" --cd-allow-form2; \
+  [ "${RECURSIVE:-no}" = yes ] && set -- "$$@" --recursive; \
+  [ -n "${CACHE_HUNKS:-}" ] && set -- "$$@" --cache-hunks "$$CACHE_HUNKS"; \
+  [ -n "${CACHE_BYTES:-}" ] && set -- "$$@" --cache-bytes "$$CACHE_BYTES"; \
+  [ -n "${MAX_OPEN_CHDS:-}" ] && set -- "$$@" --max-open-chds "$$MAX_OPEN_CHDS"; \
+  [ "${VERBOSE:-no}" = yes ] && set -- "$$@" --verbose; \
+  echo "Starting: $$*"; \
+  exec "$$@" \
 '
 
 ExecStop=/bin/sh -c '/usr/bin/fusermount3 -u "$$TARGET" || /bin/true'
