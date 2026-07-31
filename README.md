@@ -17,6 +17,7 @@ Designed for PS2 (OPL over SMB/UDPBD) and NAS setups where you want CHD space sa
   - **2048-byte sectors** (Mode1 / Mode2-Form1) → exposed as `.iso`.
   - **2324-byte sectors** (Mode2-Form2 XA video/audio) → exposed as `.bin` **when enabled**.
 - 🧪 **Pragmatic fallback** — If no DVD/CD metadata is found, safely falls back to raw 2048 passthrough where valid.
+- 🎮 **VCD output (PS1)** — With `--vcd`, CD CHDs are exposed as POPSTARTER/OPL-compatible `.vcd` files (1 MiB cue2pops v2.0 header + raw 2352 disc image). DVD (PS2) CHDs stay `.iso`.
 - ⚡ **LRU cache** — Tunable by entry count or memory cap for fast hunk/frame access.
 - 🔒 **Read-only** — No writes, no temp files; streams directly from CHD.
 - 🧭 **RetroNAS-friendly** — Keep `…/playstation2/chd` as source, mount at `…/playstation2/iso` for symlink compatibility.

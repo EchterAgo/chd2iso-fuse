@@ -36,6 +36,13 @@ Allow access by users other than the one who mounted.
 Enable support for CD-ROM XA Form2 tracks.
 
 .TP
+\fB--vcd\fR
+Serve CD (PlayStation) CHDs as POPSTARTER/OPL-compatible \fI.vcd\fR files
+instead of \fI.iso\fR.  Each VCD is a 1 MiB cue2pops v2.0 header followed by the
+raw 2352-byte disc image (all tracks).  DVD (PS2) CHDs are unaffected and remain
+\fI.iso\fR.
+
+.TP
 \fB--cache-hunks\fR \fIN\fR
 Number of CHD hunks to cache in memory (default: 256).
 

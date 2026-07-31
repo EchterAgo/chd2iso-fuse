@@ -28,6 +28,13 @@ const TTL: Duration = Duration::from_secs(1);
 const CD_FRAME_2352: usize = 2352;
 const CD_FRAME_2448: usize = 2448; // 2352-byte raw sector + 96-byte subchannel (chdman createcd output)
 
+/// VCD (POPSTARTER/OPL) format: a 1 MiB header followed by the raw 2352-byte disc image.
+/// Header layout matches the cue2pops v2.0 specification (see <https://github.com/leji-a/psx-vcd>).
+const VCD_HEADER_SIZE: usize = 0x10_0000; // 1 MiB
+const VCD_PREGAP_SECTORS: u32 = 150; // 2 seconds at 75 sectors/second
+/// cue2pops v2.0 signature ("kHn ") written at offset 0x400.
+const VCD_SIGNATURE: [u8; 4] = [0x6B, 0x48, 0x6E, 0x20];
+
 /// Flags / CLI
 #[derive(Parser, Debug)]
 #[command(
@@ -66,6 +73,10 @@ struct Args {
     #[arg(long = "cd-allow-form2", default_value_t = false)]
     cd_allow_form2: bool,
 
+    /// Serve CD (PlayStation) CHDs as POPSTARTER/OPL-compatible .vcd files instead of .iso
+    #[arg(long = "vcd", default_value_t = false)]
+    vcd: bool,
+
     /// Recurse into subdirectories when scanning for *.chd files
     #[arg(long = "recursive", default_value_t = false)]
     recursive: bool,
@@ -89,6 +100,16 @@ enum BackingKind {
     },
     /// Raw/unrecognized, default to 2048 passthrough (rare/fallback)
     Raw2048,
+    /// PlayStation CD served as a POPSTARTER/OPL VCD: a 1 MiB header followed by
+    /// the raw 2352-byte disc image (all tracks, in order).
+    Vcd {
+        /// Number of 2352-byte sectors in the disc image (body length / 2352).
+        total_frames: u64,
+        /// Raw frame size stored in the CHD: 2352 (no subchannel) or 2448 (with subchannel).
+        frame_bytes: usize,
+        /// Track table used to build the VCD TOC header.
+        tracks: Arc<Vec<TrackInfo>>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -124,6 +145,8 @@ struct FsState {
     open_chds: Mutex<LruCache<u64, ChdHandle>>,
     frame_cache: Mutex<LruCache<(u64, u64), Vec<u8>>>,
     approx_cache_bytes: Mutex<usize>,
+    /// Cached 1 MiB VCD headers, keyed by file_id (inode). Built lazily on first read.
+    vcd_header_cache: Mutex<LruCache<u64, Arc<Vec<u8>>>>,
 }
 
 impl FsState {
@@ -141,6 +164,7 @@ impl FsState {
             open_chds: Mutex::new(LruCache::new(open_chds_cap)),
             frame_cache: Mutex::new(LruCache::new(cache_cap)),
             approx_cache_bytes: Mutex::new(0),
+            vcd_header_cache: Mutex::new(LruCache::new(open_chds_cap)),
             args,
         })
     }
@@ -238,6 +262,16 @@ impl FsState {
         if unit_bytes == 2352 {
             let total_frames = logical_bytes / 2352;
 
+            if self.args.vcd {
+                return self.build_vcd_entry(
+                    &mut chd,
+                    chd_path,
+                    stem,
+                    CD_FRAME_2352,
+                    total_frames,
+                );
+            }
+
             if let Some((first_lba, payload, track_frames)) = {
                 let mut rf = BufReader::new(File::open(chd_path)?);
                 parse_cd_toc_from_metadata(&mut chd, &mut rf, self.args.cd_allow_form2)?
@@ -300,6 +334,16 @@ impl FsState {
 
         if unit_bytes == CD_FRAME_2448 {
             let total_frames = logical_bytes / CD_FRAME_2448 as u64;
+
+            if self.args.vcd {
+                return self.build_vcd_entry(
+                    &mut chd,
+                    chd_path,
+                    stem,
+                    CD_FRAME_2448,
+                    total_frames,
+                );
+            }
 
             if let Some((first_lba, payload, track_frames)) = {
                 let mut rf = BufReader::new(File::open(chd_path)?);
@@ -496,6 +540,63 @@ impl FsState {
 
         Ok(owned)
     }
+
+    /// Build a VCD index entry for a CD CHD: a 1 MiB POPSTARTER/OPL header followed
+    /// by the raw 2352-byte disc image (all tracks, in order).
+    fn build_vcd_entry(
+        &self,
+        chd: &mut Chd<BufReader<File>>,
+        chd_path: &Path,
+        stem: &str,
+        frame_bytes: usize,
+        total_frames: u64,
+    ) -> Result<Option<(String, BackingKind, u64)>> {
+        let mut rf = BufReader::new(File::open(chd_path)?);
+        let mut tracks = parse_all_tracks_from_metadata(chd, &mut rf)?;
+
+        // No CD track metadata: assume a single Mode2 data track spanning the disc.
+        if tracks.is_empty() {
+            tracks.push(TrackInfo {
+                number: 1,
+                kind: TrackKind::Mode2Form1,
+                frames: total_frames as u32,
+                pregap: 0,
+                postgap: 0,
+            });
+        }
+
+        let name = format!("{stem}.vcd");
+        let size = VCD_HEADER_SIZE as u64 + total_frames * CD_FRAME_2352 as u64;
+        let kind = BackingKind::Vcd {
+            total_frames,
+            frame_bytes,
+            tracks: Arc::new(tracks),
+        };
+
+        Ok(Some((name, kind, size)))
+    }
+
+    /// Return the cached 1 MiB VCD header for the given file, building it on first use.
+    fn get_vcd_header(
+        &self,
+        file_id: u64,
+        tracks: &[TrackInfo],
+        total_frames: u64,
+    ) -> Arc<Vec<u8>> {
+        let mut cache = self
+            .vcd_header_cache
+            .lock()
+            .expect("vcd_header_cache mutex poisoned");
+
+        if let Some(h) = cache.get(&file_id) {
+            return Arc::clone(h);
+        }
+
+        let header = Arc::new(build_vcd_header(tracks, total_frames));
+        let ret = Arc::clone(&header);
+        cache.put(file_id, header);
+        ret
+    }
 }
 
 /// Parse CD TOC from CHD metadata (CHTR/CHT2). Returns (first_data_lba, payload_kind, frames_in_track).
@@ -574,6 +675,114 @@ enum TrackKind {
     Mode2Form1,
     Mode2Form2,
     Mode2Raw,
+}
+
+/// Parse every CD track described in the CHD metadata (CHTR/CHT2), sorted by track number.
+fn parse_all_tracks_from_metadata<R: Read + Seek>(
+    chd: &mut Chd<R>,
+    file: &mut R,
+) -> Result<Vec<TrackInfo>> {
+    let mut tracks: Vec<TrackInfo> = Vec::new();
+
+    for mref in chd.metadata_refs() {
+        let md: Metadata = mref.read(file)?;
+        let tag = md.metatag;
+
+        if tag != KnownMetadata::CdRomTrack.metatag() && tag != KnownMetadata::CdRomTrack2.metatag()
+        {
+            continue;
+        }
+
+        let s = String::from_utf8_lossy(&md.value).to_string();
+        if let Some(ti) = parse_track_line(&s) {
+            tracks.push(ti);
+        }
+    }
+
+    tracks.sort_by_key(|t| t.number);
+    Ok(tracks)
+}
+
+/// Encode a value (0..=99) as a single Binary-Coded-Decimal byte.
+fn to_bcd(v: u8) -> u8 {
+    ((v / 10) << 4) | (v % 10)
+}
+
+/// Convert an LBA sector count into a 3-byte BCD MSF (Minutes:Seconds:Frames).
+fn msf_bcd_from_sectors(sectors: u32) -> [u8; 3] {
+    let frames = sectors % 75;
+    let total_seconds = sectors / 75;
+    let seconds = total_seconds % 60;
+    let minutes = total_seconds / 60;
+    [to_bcd(minutes as u8), to_bcd(seconds as u8), to_bcd(frames as u8)]
+}
+
+/// Build the 1 MiB VCD header (cue2pops v2.0 layout) for a disc with the given track
+/// table and total raw-sector count. See <https://github.com/leji-a/psx-vcd>.
+fn build_vcd_header(tracks: &[TrackInfo], total_frames: u64) -> Vec<u8> {
+    let mut h = vec![0u8; VCD_HEADER_SIZE];
+
+    let total_sectors = total_frames as u32;
+    let track_count = tracks.len().clamp(1, 99) as u8;
+
+    let first_is_audio = tracks.first().map(|t| t.kind == TrackKind::Audio).unwrap_or(false);
+    let last_is_audio = tracks.last().map(|t| t.kind == TrackKind::Audio).unwrap_or(false);
+    let content_type = if last_is_audio { 0x01 } else { 0x41 };
+
+    // Descriptor A0 (first track / disc type).
+    h[0] = if first_is_audio { 0x01 } else { 0x41 };
+    h[2] = 0xA0;
+    h[7] = 0x01; // first track number
+    h[8] = 0x20; // CD-XA disc type
+
+    // Descriptor A1 (last track / content type).
+    h[10] = content_type;
+    h[12] = 0xA1;
+    h[17] = to_bcd(track_count);
+    h[20] = content_type;
+
+    // Descriptor A2 (lead-out): cue2pops adds 150 sectors for the lead-out MSF.
+    h[22] = 0xA2;
+    let leadout = msf_bcd_from_sectors(total_sectors + VCD_PREGAP_SECTORS);
+    h[27] = leadout[0];
+    h[28] = leadout[1];
+    h[29] = leadout[2];
+
+    // Track entries (10 bytes each), starting at offset 0x1E, using cue2pops v2.0 MSF math.
+    let mut accumulated: u32 = 0;
+    let mut offset = 30;
+    for (i, t) in tracks.iter().enumerate() {
+        if offset + 10 > 1024 {
+            break; // never overrun into the signature/sector-count area
+        }
+
+        h[offset] = if t.kind == TrackKind::Audio { 0x01 } else { 0x41 };
+        h[offset + 2] = to_bcd((t.number % 100) as u8);
+
+        let (index00_sector, index01_sector) = if i == 0 {
+            (0u32, VCD_PREGAP_SECTORS)
+        } else if t.pregap > 0 {
+            let i00 = accumulated + VCD_PREGAP_SECTORS + VCD_PREGAP_SECTORS;
+            (i00, i00 + VCD_PREGAP_SECTORS)
+        } else {
+            let s = accumulated + VCD_PREGAP_SECTORS;
+            (s, s)
+        };
+
+        h[offset + 3..offset + 6].copy_from_slice(&msf_bcd_from_sectors(index00_sector));
+        h[offset + 7..offset + 10].copy_from_slice(&msf_bcd_from_sectors(index01_sector));
+
+        accumulated += t.frames;
+        offset += 10;
+    }
+
+    // cue2pops v2.0 signature at 0x400 and total sector counts at 0x408 / 0x40C.
+    h[1024..1028].copy_from_slice(&VCD_SIGNATURE);
+    let sector_bytes = total_sectors.to_le_bytes();
+    h[1032..1036].copy_from_slice(&sector_bytes);
+    h[1036..1040].copy_from_slice(&sector_bytes);
+
+    h
 }
 
 #[cfg(feature = "doccheck")]
@@ -951,6 +1160,55 @@ impl Filesystem for FsState {
                     reply,
                 );
             }
+            BackingKind::Vcd {
+                total_frames,
+                frame_bytes,
+                ref tracks,
+            } => {
+                let header_size = VCD_HEADER_SIZE as u64;
+                let body_size = total_frames * CD_FRAME_2352 as u64;
+                let total = header_size + body_size;
+
+                if offset >= total {
+                    reply.data(&[]);
+                    return;
+                }
+
+                let end = offset.saturating_add(size as u64).min(total);
+                let mut out = Vec::with_capacity((end - offset) as usize);
+                let mut pos = offset;
+
+                // Serve from the 1 MiB header region.
+                if pos < header_size {
+                    let header = self.get_vcd_header(file_id, tracks, total_frames);
+                    let h_end = end.min(header_size);
+                    out.extend_from_slice(&header[pos as usize..h_end as usize]);
+                    pos = h_end;
+                }
+
+                // Serve the raw 2352-byte disc image that follows the header.
+                while pos < end {
+                    let body_off = pos - header_size;
+                    let frame_idx = body_off / CD_FRAME_2352 as u64;
+                    let in_frame = (body_off % CD_FRAME_2352 as u64) as usize;
+
+                    let sec = match self.get_cd_frame(file_id, &chd_path, frame_idx, frame_bytes) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            error!("vcd frame read error: {:?}", e);
+                            reply.error(Errno::from_i32(libc::EIO));
+                            return;
+                        }
+                    };
+
+                    let avail = CD_FRAME_2352 - in_frame;
+                    let take = avail.min((end - pos) as usize);
+                    out.extend_from_slice(&sec[in_frame..in_frame + take]);
+                    pos += take as u64;
+                }
+
+                reply.data(&out);
+            }
         }
     }
 }
@@ -1088,5 +1346,95 @@ mod tests {
     fn parse_malformed_track_line() {
         let line = "TRACK:4 FRAMES:100";
         assert!(parse_track_line(line).is_none());
+    }
+
+    #[test]
+    fn vcd_msf_bcd_conversion() {
+        // 0 sectors -> 00:00:00
+        assert_eq!(msf_bcd_from_sectors(0), [0x00, 0x00, 0x00]);
+        // 150 sectors = 2 seconds -> 00:02:00
+        assert_eq!(msf_bcd_from_sectors(150), [0x00, 0x02, 0x00]);
+        // 1 minute 30 seconds 50 frames = (90*75 + 50) = 6800 sectors
+        assert_eq!(msf_bcd_from_sectors(90 * 75 + 50), [0x01, 0x30, 0x50]);
+    }
+
+    #[test]
+    fn vcd_header_single_data_track() {
+        let tracks = vec![TrackInfo {
+            number: 1,
+            kind: TrackKind::Mode2Form1,
+            frames: 10_000,
+            pregap: 0,
+            postgap: 0,
+        }];
+        let total_frames = 10_000u64;
+        let h = build_vcd_header(&tracks, total_frames);
+
+        assert_eq!(h.len(), VCD_HEADER_SIZE);
+
+        // Descriptor A0 (data disc, CD-XA).
+        assert_eq!(h[0], 0x41);
+        assert_eq!(h[2], 0xA0);
+        assert_eq!(h[7], 0x01);
+        assert_eq!(h[8], 0x20);
+
+        // Descriptor A1 (data content, one track).
+        assert_eq!(h[10], 0x41);
+        assert_eq!(h[12], 0xA1);
+        assert_eq!(h[17], to_bcd(1));
+        assert_eq!(h[20], 0x41);
+
+        // Descriptor A2 lead-out = total + 150 sectors.
+        assert_eq!(h[22], 0xA2);
+        assert_eq!(
+            [h[27], h[28], h[29]],
+            msf_bcd_from_sectors(total_frames as u32 + 150)
+        );
+
+        // First track entry: type DATA, number 1, INDEX 00 = 0, INDEX 01 = 150.
+        assert_eq!(h[30], 0x41);
+        assert_eq!(h[32], to_bcd(1));
+        assert_eq!([h[33], h[34], h[35]], msf_bcd_from_sectors(0));
+        assert_eq!([h[37], h[38], h[39]], msf_bcd_from_sectors(150));
+
+        // cue2pops signature and duplicated little-endian sector counts.
+        assert_eq!(&h[1024..1028], &VCD_SIGNATURE);
+        assert_eq!(&h[1032..1036], &(total_frames as u32).to_le_bytes());
+        assert_eq!(&h[1036..1040], &(total_frames as u32).to_le_bytes());
+    }
+
+    #[test]
+    fn vcd_header_data_plus_audio_track() {
+        let tracks = vec![
+            TrackInfo {
+                number: 1,
+                kind: TrackKind::Mode2Form1,
+                frames: 20_000,
+                pregap: 0,
+                postgap: 0,
+            },
+            TrackInfo {
+                number: 2,
+                kind: TrackKind::Audio,
+                frames: 5_000,
+                pregap: 0,
+                postgap: 0,
+            },
+        ];
+        let total_frames = 25_000u64;
+        let h = build_vcd_header(&tracks, total_frames);
+
+        // Last track is audio -> A1 content type is CDDA (0x01).
+        assert_eq!(h[10], 0x01);
+        assert_eq!(h[17], to_bcd(2));
+        assert_eq!(h[20], 0x01);
+
+        // Track 2 entry (offset 40): audio type, number 2,
+        // INDEX 00 = INDEX 01 = track1_frames + 150.
+        assert_eq!(h[40], 0x01);
+        assert_eq!(h[42], to_bcd(2));
+        let expected = msf_bcd_from_sectors(20_000 + 150);
+        assert_eq!([h[43], h[44], h[45]], expected);
+        assert_eq!([h[47], h[48], h[49]], expected);
     }
 }
